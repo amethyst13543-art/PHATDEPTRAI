@@ -1,5 +1,5 @@
 # ================================================
-# app.py - AI Xử Lý Ảnh Production (Render.com)
+# app.py - AI Xử Lý Ảnh SaaS Production (Render)
 # ================================================
 from __future__ import annotations
 
@@ -22,11 +22,11 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from PIL import Image, ImageColor
+from PIL import Image, ImageColor, ImageFilter
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("vision-ai")
+logger = logging.getLogger("saas-image-engine")
 
 # ---------- Rate Limiter (chống spam/DDoS) ----------
 class RateLimiter:
@@ -39,7 +39,6 @@ class RateLimiter:
     async def is_allowed(self, ip: str) -> bool:
         async with self.lock:
             now = time.time()
-            # Xóa timestamp cũ
             self.requests[ip] = [t for t in self.requests[ip] if now - t < self.window]
             if len(self.requests[ip]) >= self.max_requests:
                 return False
@@ -48,7 +47,7 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(max_requests=10, window=60)
 
-# ---------- Model Singleton (tải một lần khi startup) ----------
+# ---------- Model Singleton (tải một lần) ----------
 _rmbg_session = None
 
 @asynccontextmanager
@@ -57,51 +56,33 @@ async def lifespan(app: FastAPI):
     try:
         from rembg import new_session
         os.environ["ONNX_PROVIDERS"] = "CPUExecutionProvider"
-        _rmbg_session = new_session("u2netp")  # model nhẹ nhất (~4MB)
+        _rmbg_session = new_session("u2netp")  # model nhẹ nhất
         logger.info("✅ Đã tải model tách nền (u2netp).")
     except Exception as e:
         logger.critical(f"❌ Không thể tải model: {e}")
-        raise RuntimeError("Khởi tạo model thất bại. Ứng dụng không thể hoạt động.") from e
+        raise RuntimeError("Khởi tạo model thất bại.") from e
     yield
-    # Cleanup
     if _rmbg_session:
         del _rmbg_session
     gc.collect()
 
 # ---------- FastAPI App ----------
-app = FastAPI(
-    title="AI Xử Lý Ảnh Thế Hệ Mới",
-    description="Tách nền, làm nét, cân bằng sáng tự động, pipeline liên hoàn",
-    version="6.0.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="AI Image SaaS Pro", version="7.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=[""], allow_credentials=True, allow_methods=[""], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------- Exception handler toàn cục ----------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     if isinstance(exc, HTTPException):
         return JSONResponse(status_code=exc.status_code, content={"error": True, "message": exc.detail})
-    logger.error(f"Ngoại lệ không xử lý: {exc}\n{traceback.format_exc()}")
-    return JSONResponse(status_code=500, content={"error": True, "message": "Lỗi máy chủ nội bộ. Vui lòng thử lại sau."})
+    logger.error(f"Ngoại lệ: {exc}\n{traceback.format_exc()}")
+    return JSONResponse(status_code=500, content={"error": True, "message": "Lỗi máy chủ nội bộ."})
 
-# ---------- Rate Limiting Middleware (chỉ POST) ----------
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if request.method == "POST":
         client_ip = request.client.host if request.client else "127.0.0.1"
         if not await rate_limiter.is_allowed(client_ip):
-            return JSONResponse(
-                status_code=429,
-                content={"error": True, "message": "IP của bạn thao tác quá nhanh. Vui lòng thử lại sau 1 phút."},
-            )
+            return JSONResponse(status_code=429, content={"error": True, "message": "IP của bạn thao tác quá nhanh. Vui lòng thử lại sau 1 phút."})
     response = await call_next(request)
     return response
 
@@ -112,14 +93,12 @@ def validate_hex_color(color: str) -> str:
     return color.upper()
 
 async def read_and_validate_file(file: UploadFile, max_mb: int = 10) -> bytes:
-    """Đọc file upload, kiểm tra MIME type và kích thước."""
-    allowed_types = {"image/jpeg", "image/png", "image/webp"}
-    if file.content_type not in allowed_types:
-        raise HTTPException(status_code=415, detail="Chỉ chấp nhận ảnh JPEG, PNG hoặc WebP.")
+    allowed = {"image/jpeg", "image/png", "image/webp"}
+    if file.content_type not in allowed:
+        raise HTTPException(415, "Chỉ chấp nhận ảnh JPEG, PNG hoặc WebP.")
     content = await file.read()
-    size_mb = len(content) / (1024 * 1024)
-    if size_mb > max_mb:
-        raise HTTPException(status_code=413, detail=f"Ảnh vượt quá {max_mb}MB ({size_mb:.1f}MB).")
+    if len(content) / (1024*1024) > max_mb:
+        raise HTTPException(413, f"Ảnh vượt quá {max_mb}MB.")
     return content
 
 def pil_to_base64(img: Image.Image, fmt: str = "PNG") -> str:
@@ -127,403 +106,473 @@ def pil_to_base64(img: Image.Image, fmt: str = "PNG") -> str:
     img.save(buf, format=fmt)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-# ---------- Các hàm xử lý ảnh (đồng bộ, chạy trong thread) ----------
-def _remove_background_sync(
-    img_bytes: bytes,
-    output_type: str = "transparent",
-    hex_color: Optional[str] = None,
-    bg_bytes: Optional[bytes] = None,
-) -> Image.Image:
-    """Tách nền ảnh. Trả về PIL Image."""
+def limit_pixels(w: int, h: int, max_mp: int = 16):
+    if w * h > max_mp * 1_000_000:
+        raise HTTPException(413, f"Ảnh sau xử lý vượt quá {max_mp}MP, vui lòng giảm kích thước hoặc mức phóng.")
+
+# ---------- Xử lý ảnh (đồng bộ, chạy trong thread) ----------
+def _remove_bg(img_bytes: bytes, output_type: str = "transparent", hex_color: Optional[str] = None, bg_bytes: Optional[bytes] = None) -> Image.Image:
     from rembg import remove
     img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
     w, h = img.size
-    if w * h > 12_000_000:  # 12 MP
-        raise ValueError("Ảnh có độ phân giải quá lớn (>12MP), vui lòng giảm kích thước.")
-
-    output = remove(img, session=_rmbg_session)  # PIL Image RGBA
-
+    if w * h > 12_000_000:
+        raise ValueError("Ảnh quá lớn (>12MP).")
+    output = remove(img, session=_rmbg_session)
+    del img; gc.collect()
     if output_type == "transparent":
         return output
     elif output_type == "hex_color":
-        if not hex_color:
-            raise ValueError("Thiếu mã màu nền cho chế độ đổ màu.")
+        if not hex_color: raise ValueError("Thiếu mã màu.")
         validate_hex_color(hex_color)
         rgb = ImageColor.getrgb(hex_color)
-        background = Image.new("RGBA", output.size, rgb + (255,))
-        background.paste(output, (0, 0), output)
-        return background.convert("RGB")
+        bg = Image.new("RGBA", output.size, rgb + (255,))
+        bg.paste(output, (0,0), output)
+        del output; gc.collect()
+        return bg.convert("RGB")
     elif output_type == "base64_bg":
-        if bg_bytes is None:
-            raise ValueError("Chế độ ghép nền yêu cầu ảnh nền.")
-        bg_img = Image.open(io.BytesIO(bg_bytes)).convert("RGBA")
-        bg_img = bg_img.resize(output.size, Image.LANCZOS)
-        bg_img.paste(output, (0, 0), output)
+        if bg_bytes is None: raise ValueError("Thiếu ảnh nền.")
+        bg_img = Image.open(io.BytesIO(bg_bytes)).convert("RGBA").resize(output.size, Image.LANCZOS)
+        bg_img.paste(output, (0,0), output)
+        del output; gc.collect()
         return bg_img
     else:
-        raise ValueError(f"Chế độ nền không hợp lệ: {output_type}")
+        raise ValueError("Chế độ không hợp lệ.")
 
-def _auto_retouch_sync(img_bytes: bytes) -> Image.Image:
-    """
-    Tự động cân bằng sáng/màu (Auto HDR effect).
-    Sử dụng OpenCV CLAHE + tăng saturation.
-    """
-    pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
-    rgba = np.array(pil_img)
-    rgb = rgba[..., :3]
-    alpha = rgba[..., 3] if rgba.shape[2] == 4 else None
+def _super_resolution(img_bytes: bytes, scale: float = 2.0) -> Image.Image:
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    w, h = img.size
+    new_w, new_h = int(w * scale), int(h * scale)
+    limit_pixels(new_w, new_h, max_mp=16)  # giới hạn sau phóng
+    # Lanczos4 resize
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    # Unsharp Masking
+    img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+    gc.collect()
+    return img
 
-    # Tăng saturation trong không gian HSV
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
-    h, s, v = cv2.split(hsv)
-    s = np.clip(s * 1.3, 0, 255)  # tăng 30%
-    hsv = cv2.merge([h, s, v]).astype(np.uint8)
-    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-
-    # CLAHE trên kênh L của LAB để cải thiện tương phản
+def _cinematic_hdr(img_bytes: bytes) -> Image.Image:
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+    rgba = np.array(img); del img; gc.collect()
+    rgb = rgba[..., :3]; alpha = rgba[..., 3] if rgba.shape[2] == 4 else None
+    # CLAHE trên kênh L
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l, a, b = cv2.split(lab); del lab
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     l = clahe.apply(l)
-    lab = cv2.merge([l, a, b])
-    rgb = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-    # Ghép lại kênh alpha nếu có
+    # Gamma correction (gamma=1.2)
+    l_float = l.astype(np.float32) / 255.0
+    l_corrected = np.power(l_float, 1.2) * 255.0
+    l = np.clip(l_corrected, 0, 255).astype(np.uint8)
+    lab = cv2.merge([l, a, b]); del l, a, b
+    rgb = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB); del lab
+    # Tăng saturation nhẹ
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    h, s, v = cv2.split(hsv); del hsv
+    s = np.clip(s * 1.2, 0, 255).astype(np.uint8)
+    hsv = cv2.merge([h, s, v]); del h, s, v
+    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB); del hsv
     if alpha is not None:
-        out = np.dstack((rgb, alpha))
+        out = np.dstack((rgb, alpha)); del rgb, alpha
     else:
-        out = rgb
-    return Image.fromarray(out, "RGBA" if alpha is not None else "RGB")
+        out = rgb; del rgb
+    result = Image.fromarray(out, "RGBA" if alpha is not None else "RGB")
+    del out; gc.collect()
+    return result
 
-def _enhance_sync(img_bytes: bytes, upscale_factor: float = 2.0, face_enhance: bool = False) -> Image.Image:
-    """Làm nét ảnh (placeholder)."""
-    raise NotImplementedError("Tính năng làm nét ảnh đang được phát triển, mong bạn quay lại sau.")
+def _denoise_skin(img_bytes: bytes) -> Image.Image:
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+    rgba = np.array(img); del img; gc.collect()
+    rgb = rgba[..., :3]; alpha = rgba[..., 3] if rgba.shape[2] == 4 else None
+    # Bilateral filter (giữ cạnh, làm mịn vùng phẳng)
+    filtered = cv2.bilateralFilter(rgb, d=9, sigmaColor=75, sigmaSpace=75)
+    if alpha is not None:
+        out = np.dstack((filtered, alpha)); del filtered, alpha
+    else:
+        out = filtered; del filtered
+    result = Image.fromarray(out, "RGBA" if alpha is not None else "RGB")
+    del out; gc.collect()
+    return result
 
 def _pipeline_sync(img_bytes: bytes, steps: List[dict]) -> Image.Image:
-    """Xử lý ảnh qua chuỗi các bước (mỗi bước là một dict có 'action' và 'params')."""
+    """Xử lý ảnh qua chuỗi bước (mỗi bước có 'action' và 'params')."""
     current_bytes = img_bytes
     for step in steps:
         action = step.get("action")
         params = step.get("params", {})
-
         if action == "remove_bg":
             output_type = params.get("output_type", "transparent")
-            hex_color = params.get("hex_color", None)
+            hex_color = params.get("hex_color")
             bg_bytes = None
             if output_type == "base64_bg" and "bg_image" in params:
-                # bg_image là base64 string từ giao diện (nếu có)
                 bg_b64 = params["bg_image"]
                 if bg_b64.startswith("data:"):
                     bg_b64 = bg_b64.split(",", 1)[1]
                 bg_bytes = base64.b64decode(bg_b64)
-            result = _remove_background_sync(current_bytes, output_type, hex_color, bg_bytes)
-        elif action == "retouch":
-            result = _auto_retouch_sync(current_bytes)
-        elif action == "enhance":
-            raise NotImplementedError("Tính năng làm nét chưa sẵn sàng trong pipeline.")
+            result = _remove_bg(current_bytes, output_type, hex_color, bg_bytes)
+        elif action == "super_res":
+            scale = float(params.get("scale", 2.0))
+            result = _super_resolution(current_bytes, scale)
+        elif action == "hdr":
+            result = _cinematic_hdr(current_bytes)
+        elif action == "denoise":
+            result = _denoise_skin(current_bytes)
         else:
             raise ValueError(f"Hành động không hợp lệ: {action}")
-
-        # Lưu kết quả thành bytes để bước sau sử dụng
         buf = io.BytesIO()
-        result.save(buf, format="PNG")
+        fmt = params.get("format", "PNG")  # Cho từng bước xuất PNG để không mất chất lượng
+        result.save(buf, format=fmt)
         current_bytes = buf.getvalue()
-        gc.collect()
-
+        del result, buf; gc.collect()
     return Image.open(io.BytesIO(current_bytes))
 
-# ---------- Giao diện Web Glassmorphism ----------
+# ---------- Endpoints ----------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse(content=HTML_UI)
+
+@app.post("/process")
+async def process(
+    image: UploadFile = File(...),
+    steps: str = Form(...),
+    output_format: str = Form("webp")  # png, jpeg, webp
+):
+    img_bytes = await read_and_validate_file(image)
+    try:
+        steps_list = json.loads(steps)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Danh sách bước xử lý không đúng JSON.")
+    try:
+        result = await asyncio.to_thread(_pipeline_sync, img_bytes, steps_list)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Pipeline lỗi: {e}")
+        raise HTTPException(500, "Xử lý thất bại.")
+    # Xuất theo định dạng yêu cầu
+    fmt = output_format.upper()
+    if fmt not in ("PNG", "JPEG", "WEBP"):
+        fmt = "WEBP"
+    b64 = pil_to_base64(result, fmt)
+    del result; gc.collect()
+    return {"image_base64": f"data:image/{fmt.lower()};base64,{b64}"}
+
+# ---------- Giao diện SaaS siêu thực ----------
 HTML_UI = """
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Xử Lý Ảnh Pro</title>
+    <title>AI Image SaaS Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
             min-height: 100vh;
             margin: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
             font-family: 'Inter', sans-serif;
+            color: #f1f5f9;
         }
         .glass {
-            background: rgba(255, 255, 255, 0.15);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            border-radius: 24px;
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            background: rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 20px;
         }
-        .drag-over {
-            border-color: #3b82f6;
-            background: rgba(59, 130, 246, 0.1);
-        }
-        .slider-container {
-            position: relative;
-            width: 100%;
-            height: 300px;
-            overflow: hidden;
-        }
-        .slider-container img {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-        }
-        .img-after {
-            clip-path: inset(0 calc(100% - var(--pos, 50%)) 0 0);
-        }
-        input[type=range] {
-            -webkit-appearance: none;
-            appearance: none;
-            width: 100%;
-            height: 6px;
-            background: #fff;
-            border-radius: 5px;
-            outline: none;
-        }
-        input[type=range]::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            appearance: none;
-            width: 22px;
-            height: 22px;
-            background: #fff;
-            border-radius: 50%;
-            cursor: pointer;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
-        }
-        .btn-active {
-            background: rgba(255, 255, 255, 0.3);
-        }
+        .drag-over { border-color: #3b82f6; background: rgba(59,130,246,0.15); }
+        .slider-container { position: relative; width: 100%; height: 360px; overflow: hidden; border-radius: 16px; }
+        .slider-container img { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
+        .img-after { clip-path: inset(0 calc(100% - var(--pos, 50%)) 0 0); }
+        input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; background: #cbd5e1; border-radius: 5px; outline: none; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; background: #fff; border-radius: 50%; cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.3); }
+        .btn-active { background: rgba(255,255,255,0.2); }
+        .terminal { background: #0f172a; color: #10b981; font-family: 'Courier New', monospace; padding: 12px; border-radius: 8px; max-height: 200px; overflow-y: auto; }
+        .terminal .line { opacity: 0; animation: fadeIn 0.3s forwards; }
+        @keyframes fadeIn { to { opacity: 1; } }
     </style>
 </head>
-<body>
-<div class="glass w-full max-w-4xl p-6 md:p-8 text-white">
-    <h1 class="text-3xl font-bold text-center mb-6">✨ AI Xử Lý Ảnh Thế Hệ Mới</h1>
-
-    <!-- Chế độ xử lý -->
-    <div class="flex flex-wrap gap-2 mb-6 justify-center">
-        <button id="btn-remove" onclick="setMode('remove_bg')" class="px-4 py-2 rounded-full bg-white/20 hover:bg-white/30 transition btn-active">🎭 Tách nền</button>
-        <button id="btn-retouch" onclick="setMode('retouch')" class="px-4 py-2 rounded-full bg-white/20 hover:bg-white/30 transition">🌟 Cân bằng sáng</button>
-        <button id="btn-pipeline" onclick="setMode('pipeline')" class="px-4 py-2 rounded-full bg-white/20 hover:bg-white/30 transition">🔗 Combo</button>
-    </div>
-
-    <!-- Khu vực kéo thả ảnh -->
-    <div id="drop-zone" class="border-2 border-dashed border-white/50 rounded-2xl p-8 text-center cursor-pointer mb-6 transition hover:border-white/80">
-        <i class="fas fa-cloud-upload-alt text-4xl mb-2"></i>
-        <p class="text-lg font-medium">Kéo & thả ảnh vào đây</p>
-        <p class="text-sm opacity-75">hoặc click để chọn file (JPEG, PNG, WebP, tối đa 10MB)</p>
-        <input type="file" id="file-input" accept="image/jpeg,image/png,image/webp" class="hidden">
-    </div>
-
-    <!-- Thông báo lỗi -->
-    <div id="error-msg" class="hidden bg-red-500/80 text-white p-3 rounded-xl mb-4"></div>
-
-    <!-- Cấu hình cho Tách nền -->
-    <div id="config-remove" class="space-y-3 mb-4">
-        <select id="output-type" class="w-full p-2 rounded bg-white/20 text-white border border-white/30">
-            <option value="transparent">Nền trong suốt</option>
-            <option value="hex_color">Đổ màu nền</option>
-            <option value="base64_bg">Ghép với ảnh nền</option>
-        </select>
-        <div id="hex-group" class="hidden">
-            <input type="text" id="hex-color" value="#FFFFFF" class="w-full p-2 rounded bg-white/20 text-white border border-white/30 placeholder-white/70" placeholder="Mã màu hex">
+<body class="flex items-center justify-center p-4">
+<div class="glass w-full max-w-6xl p-6 md:p-8">
+    <h1 class="text-3xl font-bold text-center mb-6">🚀 AI Image SaaS Pro</h1>
+    <!-- Bảng điều khiển -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+        <!-- Sidebar chức năng -->
+        <div class="col-span-1 space-y-4">
+            <div class="glass p-4 space-y-3">
+                <h2 class="text-lg font-semibold">🧠 Chức năng</h2>
+                <div class="flex flex-col gap-2">
+                    <button onclick="addStep('remove_bg')" class="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 transition text-sm">🎭 Tách nền</button>
+                    <button onclick="addStep('super_res')" class="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 transition text-sm">🔍 Phóng to siêu nét</button>
+                    <button onclick="addStep('hdr')" class="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 transition text-sm">🎬 Cinematic HDR</button>
+                    <button onclick="addStep('denoise')" class="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 transition text-sm">🧼 Làm mịn da / Khử nhiễu</button>
+                </div>
+            </div>
+            <div class="glass p-4 space-y-3">
+                <h2 class="text-lg font-semibold">⚙️ Tham số</h2>
+                <div id="param-container" class="space-y-2"></div>
+            </div>
+            <div class="glass p-4 space-y-3">
+                <h2 class="text-lg font-semibold">📦 Định dạng xuất</h2>
+                <select id="output-format" class="w-full bg-white/10 border border-white/20 rounded p-2 text-white">
+                    <option value="webp" selected>WebP (siêu nhẹ, có trong suốt)</option>
+                    <option value="png">PNG (không nén, chất lượng cao)</option>
+                    <option value="jpeg">JPEG (ảnh nén, không trong suốt)</option>
+                </select>
+            </div>
+            <button onclick="clearPipeline()" class="w-full py-2 bg-red-500/20 hover:bg-red-500/30 rounded-lg transition text-sm">🗑️ Xóa chuỗi xử lý</button>
         </div>
-        <div id="bg-group" class="hidden">
-            <label class="block text-sm mb-1">Ảnh nền:</label>
-            <input type="file" id="bg-file" accept="image/*" class="w-full p-2 rounded bg-white/20 text-white border border-white/30">
-        </div>
-    </div>
-
-    <!-- Cấu hình Pipeline -->
-    <div id="config-pipeline" class="hidden space-y-3 mb-4">
-        <div class="flex flex-wrap gap-2" id="pipeline-steps"></div>
-        <div class="flex gap-2">
-            <button onclick="addStep('retouch')" class="px-3 py-1 bg-white/20 rounded-full text-sm">+ Cân bằng sáng</button>
-            <button onclick="addStep('remove_bg')" class="px-3 py-1 bg-white/20 rounded-full text-sm">+ Tách nền</button>
-            <button onclick="clearSteps()" class="px-3 py-1 bg-red-400/50 rounded-full text-sm">Xóa tất cả</button>
-        </div>
-    </div>
-
-    <!-- Nút xử lý & thanh tiến trình -->
-    <button id="process-btn" class="w-full bg-blue-500 hover:bg-blue-600 text-white font-semibold py-3 rounded-full transition mb-4">🚀 Xử lý ngay</button>
-    <div id="progress" class="hidden w-full bg-gray-200/30 rounded-full h-3 mb-4">
-        <div class="bg-gradient-to-r from-blue-400 to-purple-500 h-3 rounded-full animate-pulse w-full"></div>
-    </div>
-
-    <!-- Kết quả & so sánh Before/After -->
-    <div id="result-section" class="hidden">
-        <h3 class="text-lg font-semibold mb-2">Kết quả</h3>
-        <div class="slider-container" id="compare-container">
-            <img id="img-before" src="" alt="Ảnh gốc">
-            <img id="img-after" src="" alt="Đã xử lý" class="img-after" style="--pos:50%">
-            <input type="range" id="compare-slider" min="0" max="100" value="50" class="absolute bottom-2 left-0 right-0 mx-4">
-        </div>
-        <div class="flex justify-between mt-2">
-            <span class="text-xs">Ảnh gốc</span>
-            <span class="text-xs">Đã xử lý</span>
+        <!-- Khu vực chính -->
+        <div class="col-span-3 space-y-6">
+            <!-- Kéo thả -->
+            <div id="drop-zone" class="border-2 border-dashed border-white/30 rounded-2xl p-8 text-center cursor-pointer transition hover:border-white/60">
+                <i class="fas fa-cloud-upload-alt text-3xl mb-3"></i>
+                <p class="text-lg font-medium">Kéo & thả ảnh vào đây</p>
+                <p class="text-sm opacity-70">hoặc click để chọn (JPEG, PNG, WebP, tối đa 10MB)</p>
+                <input type="file" id="file-input" accept="image/jpeg,image/png,image/webp" class="hidden">
+            </div>
+            <!-- Chuỗi xử lý -->
+            <div id="pipeline-display" class="flex flex-wrap gap-2"></div>
+            <!-- Nút xử lý & terminal -->
+            <button id="process-btn" class="w-full py-3 bg-blue-600 hover:bg-blue-700 rounded-xl font-semibold transition flex items-center justify-center gap-2">
+                <i class="fas fa-cogs"></i> Xử lý ngay
+            </button>
+            <div id="terminal" class="terminal text-sm" style="display:none;"></div>
+            <!-- Thông báo lỗi -->
+            <div id="error-msg" class="hidden bg-red-500/80 p-3 rounded-xl"></div>
+            <!-- Kết quả so sánh -->
+            <div id="result-section" class="hidden">
+                <h3 class="text-lg font-semibold mb-3">So sánh kết quả</h3>
+                <div class="slider-container">
+                    <img id="img-before" src="" alt="Ảnh gốc">
+                    <img id="img-after" src="" alt="Đã xử lý" class="img-after" style="--pos:50%">
+                    <input type="range" id="compare-slider" min="0" max="100" value="50" class="absolute bottom-3 left-2 right-2">
+                </div>
+                <div class="flex justify-between mt-2 text-xs opacity-70">
+                    <span>Ảnh gốc</span><span>Đã xử lý</span>
+                </div>
+                <div class="mt-3 text-center">
+                    <a id="download-link" href="#" download="processed_image" class="text-blue-400 hover:underline text-sm">📥 Tải ảnh về</a>
+                </div>
+            </div>
         </div>
     </div>
 </div>
 
 <script>
-    let currentMode = 'remove_bg';
+    // State
+    let pipeline = [];
     let currentFile = null;
-    let pipelineSteps = [];
-
-    function setMode(mode) {
-        currentMode = mode;
-        document.getElementById('config-remove').classList.toggle('hidden', mode !== 'remove_bg');
-        document.getElementById('config-pipeline').classList.toggle('hidden', mode !== 'pipeline');
-        ['btn-remove','btn-retouch','btn-pipeline'].forEach(id => {
-            document.getElementById(id).classList.remove('btn-active');
-        });
-        document.getElementById('btn-' + (mode==='remove_bg'?'remove':mode==='retouch'?'retouch':'pipeline')).classList.add('btn-active');
-    }
+    let currentImageBase64 = null;
 
     // Kéo thả
     const dropZone = document.getElementById('drop-zone');
     const fileInput = document.getElementById('file-input');
-    dropZone.addEventListener('click', () => fileInput.click());
-    dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-    dropZone.addEventListener('drop', e => {
+    dropZone.addEventListener('click', ()=> fileInput.click());
+    dropZone.addEventListener('dragover', e=>{e.preventDefault(); dropZone.classList.add('drag-over');});
+    dropZone.addEventListener('dragleave', ()=> dropZone.classList.remove('drag-over'));
+    dropZone.addEventListener('drop', e=>{
         e.preventDefault();
         dropZone.classList.remove('drag-over');
-        if (e.dataTransfer.files.length) {
-            handleFile(e.dataTransfer.files[0]);
-        }
+        if(e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
     });
-    fileInput.addEventListener('change', e => {
-        if (e.target.files.length) handleFile(e.target.files[0]);
+    fileInput.addEventListener('change', e=>{
+        if(e.target.files.length) handleFile(e.target.files[0]);
     });
 
-    function handleFile(file) {
-        if (!file.type.startsWith('image/')) {
+    function handleFile(file){
+        if(!file.type.startsWith('image/')){
             showError('Vui lòng chọn file ảnh hợp lệ.');
             return;
         }
-        if (file.size > 10*1024*1024) {
-            showError('Ảnh vượt quá 10MB, vui lòng chọn ảnh nhỏ hơn.');
+        if(file.size > 10*1024*1024){
+            showError('Ảnh vượt quá 10MB.');
             return;
         }
         currentFile = file;
         const reader = new FileReader();
         reader.onload = e => {
+            currentImageBase64 = e.target.result;
             document.getElementById('img-before').src = e.target.result;
             document.getElementById('result-section').classList.add('hidden');
         };
         reader.readAsDataURL(file);
-        document.getElementById('error-msg').classList.add('hidden');
+        hideError();
     }
 
-    function showError(msg) {
+    function showError(msg){
         const el = document.getElementById('error-msg');
         el.textContent = msg;
         el.classList.remove('hidden');
     }
-
-    // Hiển thị/ẩn trường tùy chọn tách nền
-    document.getElementById('output-type').addEventListener('change', function() {
-        document.getElementById('hex-group').classList.add('hidden');
-        document.getElementById('bg-group').classList.add('hidden');
-        if (this.value === 'hex_color') document.getElementById('hex-group').classList.remove('hidden');
-        if (this.value === 'base64_bg') document.getElementById('bg-group').classList.remove('hidden');
-    });
+    function hideError(){ document.getElementById('error-msg').classList.add('hidden'); }
 
     // Pipeline builder
-    function addStep(action) {
-        pipelineSteps.push({action, params: {}});
+    function addStep(action){
+        const step = { action, params: {} };
+        pipeline.push(step);
         renderPipeline();
+        renderParams();
     }
-    function clearSteps() {
-        pipelineSteps = [];
+    function clearPipeline(){
+        pipeline = [];
         renderPipeline();
+        renderParams();
     }
-    function renderPipeline() {
-        const container = document.getElementById('pipeline-steps');
-        container.innerHTML = pipelineSteps.map((s,i) => 
-            `<span class="px-3 py-1 bg-white/20 rounded-full text-sm flex items-center gap-1">
-                ${s.action==='retouch'?'🌟 Cân bằng sáng':'🎭 Tách nền'}
-                <button onclick="removeStep(${i})" class="text-red-300 hover:text-red-500">&times;</button>
-            </span>`
-        ).join('');
-    }
-    function removeStep(index) {
-        pipelineSteps.splice(index,1);
+    function removeStep(index){
+        pipeline.splice(index,1);
         renderPipeline();
+        renderParams();
+    }
+    function renderPipeline(){
+        const container = document.getElementById('pipeline-display');
+        container.innerHTML = pipeline.map((s,i)=>`
+            <span class="px-3 py-1 bg-white/10 rounded-full text-sm flex items-center gap-1">
+                ${actionLabel(s.action)}
+                <button onclick="removeStep(${i})" class="text-red-400 hover:text-red-600">&times;</button>
+            </span>
+        `).join('');
+    }
+    function actionLabel(action){
+        const map = {
+            'remove_bg':'🎭 Tách nền',
+            'super_res':'🔍 Phóng to',
+            'hdr':'🎬 HDR',
+            'denoise':'🧼 Làm mịn'
+        };
+        return map[action] || action;
+    }
+    function renderParams(){
+        const container = document.getElementById('param-container');
+        container.innerHTML = '';
+        pipeline.forEach((step, idx)=>{
+            if(step.action === 'super_res'){
+                const scale = step.params.scale || 2.0;
+                container.innerHTML += `
+                <div class="flex items-center gap-2 text-sm">
+                    <span>🔍 Mức phóng (${idx+1}):</span>
+                    <select onchange="updateParam(${idx},'scale',this.value)" class="bg-white/10 border border-white/20 rounded p-1">
+                        <option value="1.0" ${scale==1?'selected':''}>1x</option>
+                        <option value="2.0" ${scale==2?'selected':''}>2x</option>
+                        <option value="4.0" ${scale==4?'selected':''}>4x</option>
+                        <option value="8.0" ${scale==8?'selected':''}>8x</option>
+                    </select>
+                </div>`;
+            } else if(step.action === 'remove_bg'){
+                const outputType = step.params.output_type || 'transparent';
+                container.innerHTML += `
+                <div class="flex items-center gap-2 text-sm">
+                    <span>🎨 Chế độ nền:</span>
+                    <select onchange="updateParam(${idx},'output_type',this.value)" class="bg-white/10 border border-white/20 rounded p-1">
+                        <option value="transparent" ${outputType=='transparent'?'selected':''}>Trong suốt</option>
+                        <option value="hex_color" ${outputType=='hex_color'?'selected':''}>Đổ màu</option>
+                        <option value="base64_bg" ${outputType=='base64_bg'?'selected':''}>Ghép nền</option>
+                    </select>
+                </div>`;
+                if(outputType === 'hex_color'){
+                    const hex = step.params.hex_color || '#FFFFFF';
+                    container.innerHTML += `
+                    <div class="flex items-center gap-2 text-sm">
+                        <span>Màu:</span>
+                        <input type="text" value="${hex}" onchange="updateParam(${idx},'hex_color',this.value)" class="w-20 bg-white/10 border border-white/20 rounded p-1 text-white">
+                    </div>`;
+                }
+                if(outputType === 'base64_bg'){
+                    container.innerHTML += `
+                    <div class="text-sm">
+                        <label class="block">Ảnh nền:</label>
+                        <input type="file" accept="image/*" onchange="handleBgUpload(${idx}, this)" class="mt-1 text-xs">
+                        <span id="bg-name-${idx}" class="text-xs opacity-70"></span>
+                    </div>`;
+                }
+            }
+        });
+    }
+    function updateParam(idx, key, value){
+        pipeline[idx].params[key] = value;
+        renderParams();
+    }
+    function handleBgUpload(idx, input){
+        const file = input.files[0];
+        if(file){
+            const reader = new FileReader();
+            reader.onload = e => {
+                pipeline[idx].params.bg_image = e.target.result;
+                document.getElementById('bg-name-'+idx).textContent = file.name;
+            };
+            reader.readAsDataURL(file);
+        }
     }
 
+    // Terminal mô phỏng
+    async function simulateTerminal(stepsList){
+        const terminal = document.getElementById('terminal');
+        terminal.style.display = 'block';
+        terminal.innerHTML = '<div class="text-green-400 font-bold">🔹 Bắt đầu xử lý...</div>';
+        const msgs = {
+            'remove_bg': ['Đang phân tích pixel ảnh...', 'Đang tách nền bằng AI...', 'Hoàn tất tách nền.'],
+            'super_res': ['Đang áp dụng Lanczos-4 resize...', 'Đang tăng cường đường nét (Unsharp Masking)...', 'Phóng to thành công.'],
+            'hdr': ['Đang cân bằng sáng (CLAHE)...', 'Đang điều chỉnh Gamma...', 'Đang tăng cường màu sắc...', 'Hoàn tất Cinematic HDR.'],
+            'denoise': ['Đang khử nhiễu (Bilateral Filter)...', 'Giữ lại cạnh sắc nét...', 'Làm mịn da hoàn tất.']
+        };
+        for (const step of stepsList) {
+            const lines = msgs[step.action] || ['Đang xử lý...'];
+            for (const line of lines) {
+                await delay(300);
+                terminal.innerHTML += <div class="line">▹ ${line}</div>;
+                terminal.scrollTop = terminal.scrollHeight;
+            }
+        }
+        await delay(200);
+        terminal.innerHTML += '<div class="text-green-300 font-bold mt-1">✅ Xử lý hoàn tất!</div>';
+    }
+    function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
     // Xử lý chính
-    document.getElementById('process-btn').addEventListener('click', async () => {
-        if (!currentFile) {
+    document.getElementById('process-btn').addEventListener('click', async ()=>{
+        if(!currentFile){
             showError('Vui lòng tải ảnh lên trước.');
             return;
         }
-        const progress = document.getElementById('progress');
+        if(pipeline.length === 0){
+            showError('Thêm ít nhất một bước xử lý.');
+            return;
+        }
+        hideError();
         const resultSection = document.getElementById('result-section');
-        progress.classList.remove('hidden');
         resultSection.classList.add('hidden');
-        document.getElementById('error-msg').classList.add('hidden');
-
+        // Terminal
+        await simulateTerminal(pipeline);
+        // Gửi request
         const formData = new FormData();
         formData.append('image', currentFile);
-        let url = '/process';
-
-        if (currentMode === 'remove_bg') {
-            url = '/remove-bg';
-            const outputType = document.getElementById('output-type').value;
-            formData.append('output_type', outputType);
-            if (outputType === 'hex_color')
-                formData.append('hex_color', document.getElementById('hex-color').value);
-            if (outputType === 'base64_bg') {
-                const bgFile = document.getElementById('bg-file').files[0];
-                if (!bgFile) {
-                    showError('Vui lòng chọn ảnh nền.');
-                    progress.classList.add('hidden');
-                    return;
-                }
-                formData.append('bg_image', bgFile);
-            }
-        } else if (currentMode === 'retouch') {
-            url = '/retouch';
-        } else if (currentMode === 'pipeline') {
-            if (pipelineSteps.length === 0) {
-                showError('Thêm ít nhất một bước xử lý cho combo.');
-                progress.classList.add('hidden');
-                return;
-            }
-            formData.append('steps', JSON.stringify(pipelineSteps));
-        }
-
+        formData.append('steps', JSON.stringify(pipeline));
+        formData.append('output_format', document.getElementById('output-format').value);
         try {
-            const res = await fetch(url, { method: 'POST', body: formData });
+            const res = await fetch('/process', { method: 'POST', body: formData });
             const data = await res.json();
-            if (!res.ok) throw new Error(data.message || 'Lỗi không xác định');
-
-            // Hiển thị ảnh kết quả và bật slider so sánh
-            document.getElementById('img-after').src = data.image_base64;
-            document.getElementById('img-before').src = URL.createObjectURL(currentFile);
-            document.getElementById('result-section').classList.remove('hidden');
+            if(!res.ok) throw new Error(data.message || 'Lỗi');
+            const imgAfter = document.getElementById('img-after');
+            imgAfter.src = data.image_base64;
+            document.getElementById('img-before').src = currentImageBase64;
+            resultSection.classList.remove('hidden');
             document.getElementById('compare-slider').value = 50;
-            document.getElementById('img-after').style.setProperty('--pos', '50%');
-        } catch (err) {
+            imgAfter.style.setProperty('--pos','50%');
+            // Link tải về
+            const link = document.getElementById('download-link');
+            link.href = data.image_base64;
+            const ext = document.getElementById('output-format').value;
+            link.download = processed.${ext};
+        } catch(err){
             showError(err.message);
-        } finally {
-            progress.classList.add('hidden');
         }
     });
 
     // Slider so sánh
-    document.getElementById('compare-slider').addEventListener('input', function() {
+    document.getElementById('compare-slider').addEventListener('input', function(){
         document.getElementById('img-after').style.setProperty('--pos', this.value + '%');
     });
 </script>
@@ -531,83 +580,7 @@ HTML_UI = """
 </html>
 """
 
-# ---------- Endpoints ----------
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(content=HTML_UI)
-
-@app.post("/remove-bg")
-async def remove_bg(
-    image: UploadFile = File(...),
-    output_type: str = Form("transparent"),
-    hex_color: Optional[str] = Form(None),
-    bg_image: Optional[UploadFile] = File(None),
-):
-    img_bytes = await read_and_validate_file(image)
-    bg_bytes = None
-    if bg_image:
-        bg_bytes = await read_and_validate_file(bg_image)
-
-    try:
-        result = await asyncio.to_thread(
-            _remove_background_sync, img_bytes, output_type, hex_color, bg_bytes
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Lỗi tách nền: {e}")
-        raise HTTPException(status_code=500, detail="Xử lý tách nền thất bại.")
-
-    b64 = pil_to_base64(result, "PNG")
-    gc.collect()
-    return {"image_base64": f"data:image/png;base64,{b64}"}
-
-@app.post("/retouch")
-async def retouch(image: UploadFile = File(...)):
-    img_bytes = await read_and_validate_file(image)
-    try:
-        result = await asyncio.to_thread(_auto_retouch_sync, img_bytes)
-    except Exception as e:
-        logger.error(f"Lỗi cân bằng sáng: {e}")
-        raise HTTPException(status_code=500, detail="Không thể cân bằng sáng ảnh.")
-
-    b64 = pil_to_base64(result, "PNG")
-    gc.collect()
-    return {"image_base64": f"data:image/png;base64,{b64}"}
-
-@app.post("/enhance")
-async def enhance(image: UploadFile = File(...), upscale_factor: float = Form(2.0), face_enhance: bool = Form(False)):
-    img_bytes = await read_and_validate_file(image)
-    try:
-        result = await asyncio.to_thread(_enhance_sync, img_bytes, upscale_factor, face_enhance)
-        b64 = pil_to_base64(result, "PNG")
-        gc.collect()
-        return {"image_base64": f"data:image/png;base64,{b64}"}
-    except NotImplementedError as e:
-        raise HTTPException(status_code=501, detail=str(e))
-
-@app.post("/process")
-async def process_pipeline(image: UploadFile = File(...), steps: str = Form(...)):
-    img_bytes = await read_and_validate_file(image)
-    try:
-        steps_list = json.loads(steps)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Danh sách bước xử lý không đúng định dạng JSON.")
-    try:
-        result = await asyncio.to_thread(_pipeline_sync, img_bytes, steps_list)
-    except NotImplementedError as e:
-        raise HTTPException(status_code=501, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Lỗi pipeline: {e}")
-        raise HTTPException(status_code=500, detail="Pipeline xử lý thất bại.")
-
-    b64 = pil_to_base64(result, "PNG")
-    gc.collect()
-    return {"image_base64": f"data:image/png;base64,{b64}"}
-
-# ---------- Khởi động ----------
+# ---------- Entry point ----------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
