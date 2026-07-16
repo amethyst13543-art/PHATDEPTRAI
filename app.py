@@ -1,3 +1,6 @@
+# ================================================
+# app.py - AI Xử Lý Ảnh Production (Render.com)
+# ================================================
 from __future__ import annotations
 
 import asyncio
@@ -21,15 +24,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image, ImageColor
 
-# ================================================
-# Logging
-# ================================================
+# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("vision-ai")
 
-# ================================================
-# Rate Limiter (chống spam/DDoS)
-# ================================================
+# ---------- Rate Limiter (chống spam/DDoS) ----------
 class RateLimiter:
     def __init__(self, max_requests: int = 10, window: int = 60):
         self.max_requests = max_requests
@@ -40,7 +39,7 @@ class RateLimiter:
     async def is_allowed(self, ip: str) -> bool:
         async with self.lock:
             now = time.time()
-            # Xóa các timestamp cũ
+            # Xóa timestamp cũ
             self.requests[ip] = [t for t in self.requests[ip] if now - t < self.window]
             if len(self.requests[ip]) >= self.max_requests:
                 return False
@@ -49,9 +48,7 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(max_requests=10, window=60)
 
-# ================================================
-# Model Singleton (tải một lần khi startup)
-# ================================================
+# ---------- Model Singleton (tải một lần khi startup) ----------
 _rmbg_session = None
 
 @asynccontextmanager
@@ -60,7 +57,7 @@ async def lifespan(app: FastAPI):
     try:
         from rembg import new_session
         os.environ["ONNX_PROVIDERS"] = "CPUExecutionProvider"
-        _rmbg_session = new_session("u2netp")   # nhẹ nhất (≈4MB)
+        _rmbg_session = new_session("u2netp")  # model nhẹ nhất (~4MB)
         logger.info("✅ Đã tải model tách nền (u2netp).")
     except Exception as e:
         logger.critical(f"❌ Không thể tải model: {e}")
@@ -71,9 +68,7 @@ async def lifespan(app: FastAPI):
         del _rmbg_session
     gc.collect()
 
-# ================================================
-# FastAPI App
-# ================================================
+# ---------- FastAPI App ----------
 app = FastAPI(
     title="AI Xử Lý Ảnh Thế Hệ Mới",
     description="Tách nền, làm nét, cân bằng sáng tự động, pipeline liên hoàn",
@@ -89,9 +84,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================================================
-# Exception handler toàn cục
-# ================================================
+# ---------- Exception handler toàn cục ----------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     if isinstance(exc, HTTPException):
@@ -99,9 +92,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Ngoại lệ không xử lý: {exc}\n{traceback.format_exc()}")
     return JSONResponse(status_code=500, content={"error": True, "message": "Lỗi máy chủ nội bộ. Vui lòng thử lại sau."})
 
-# ================================================
-# Rate Limiting Middleware (chỉ áp dụng POST)
-# ================================================
+# ---------- Rate Limiting Middleware (chỉ POST) ----------
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if request.method == "POST":
@@ -114,9 +105,7 @@ async def rate_limit_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 
-# ================================================
-# Helpers
-# ================================================
+# ---------- Helpers ----------
 def validate_hex_color(color: str) -> str:
     if not re.match(r"^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$", color):
         raise ValueError(f"Mã màu không hợp lệ: {color}")
@@ -138,9 +127,7 @@ def pil_to_base64(img: Image.Image, fmt: str = "PNG") -> str:
     img.save(buf, format=fmt)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-# ================================================
-# Các hàm xử lý ảnh (đồng bộ, chạy trong thread)
-# ================================================
+# ---------- Các hàm xử lý ảnh (đồng bộ, chạy trong thread) ----------
 def _remove_background_sync(
     img_bytes: bytes,
     output_type: str = "transparent",
@@ -159,6 +146,8 @@ def _remove_background_sync(
     if output_type == "transparent":
         return output
     elif output_type == "hex_color":
+        if not hex_color:
+            raise ValueError("Thiếu mã màu nền cho chế độ đổ màu.")
         validate_hex_color(hex_color)
         rgb = ImageColor.getrgb(hex_color)
         background = Image.new("RGBA", output.size, rgb + (255,))
@@ -166,7 +155,7 @@ def _remove_background_sync(
         return background.convert("RGB")
     elif output_type == "base64_bg":
         if bg_bytes is None:
-            raise ValueError("Thiếu ảnh nền để ghép.")
+            raise ValueError("Chế độ ghép nền yêu cầu ảnh nền.")
         bg_img = Image.open(io.BytesIO(bg_bytes)).convert("RGBA")
         bg_img = bg_img.resize(output.size, Image.LANCZOS)
         bg_img.paste(output, (0, 0), output)
@@ -231,7 +220,6 @@ def _pipeline_sync(img_bytes: bytes, steps: List[dict]) -> Image.Image:
         elif action == "retouch":
             result = _auto_retouch_sync(current_bytes)
         elif action == "enhance":
-            # Hiện tại chưa hỗ trợ
             raise NotImplementedError("Tính năng làm nét chưa sẵn sàng trong pipeline.")
         else:
             raise ValueError(f"Hành động không hợp lệ: {action}")
@@ -240,18 +228,11 @@ def _pipeline_sync(img_bytes: bytes, steps: List[dict]) -> Image.Image:
         buf = io.BytesIO()
         result.save(buf, format="PNG")
         current_bytes = buf.getvalue()
-        gc.collect()  # dọn rác sau mỗi bước
+        gc.collect()
 
-    # Trả về ảnh cuối cùng
     return Image.open(io.BytesIO(current_bytes))
 
-# ================================================
-# Giao diện Web siêu thực (Glassmorphism)
-# ================================================
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(content=HTML_UI)
-
+# ---------- Giao diện Web Glassmorphism ----------
 HTML_UI = """
 <!DOCTYPE html>
 <html lang="vi">
@@ -330,9 +311,9 @@ HTML_UI = """
 
     <!-- Chế độ xử lý -->
     <div class="flex flex-wrap gap-2 mb-6 justify-center">
-        <button id="btn-remove" onclick="setMode('remove_bg')" class="px-4 py-2 rounded-full bg-white/20 hover:bg-white/30 transition">🎭 Tách nền</button>
-        <button id="btn-retouch" onclick="setMode('retouch')" class="px-4 py-2 rounded-full bg-white/20 hover:bg-white/30">🌟 Cân bằng sáng</button>
-        <button id="btn-pipeline" onclick="setMode('pipeline')" class="px-4 py-2 rounded-full bg-white/20 hover:bg-white/30">🔗 Combo</button>
+        <button id="btn-remove" onclick="setMode('remove_bg')" class="px-4 py-2 rounded-full bg-white/20 hover:bg-white/30 transition btn-active">🎭 Tách nền</button>
+        <button id="btn-retouch" onclick="setMode('retouch')" class="px-4 py-2 rounded-full bg-white/20 hover:bg-white/30 transition">🌟 Cân bằng sáng</button>
+        <button id="btn-pipeline" onclick="setMode('pipeline')" class="px-4 py-2 rounded-full bg-white/20 hover:bg-white/30 transition">🔗 Combo</button>
     </div>
 
     <!-- Khu vực kéo thả ảnh -->
@@ -347,7 +328,7 @@ HTML_UI = """
     <div id="error-msg" class="hidden bg-red-500/80 text-white p-3 rounded-xl mb-4"></div>
 
     <!-- Cấu hình cho Tách nền -->
-    <div id="config-remove" class="hidden space-y-3 mb-4">
+    <div id="config-remove" class="space-y-3 mb-4">
         <select id="output-type" class="w-full p-2 rounded bg-white/20 text-white border border-white/30">
             <option value="transparent">Nền trong suốt</option>
             <option value="hex_color">Đổ màu nền</option>
@@ -550,9 +531,11 @@ HTML_UI = """
 </html>
 """
 
-# ================================================
-# Endpoints xử lý ảnh
-# ================================================
+# ---------- Endpoints ----------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse(content=HTML_UI)
+
 @app.post("/remove-bg")
 async def remove_bg(
     image: UploadFile = File(...),
@@ -624,9 +607,7 @@ async def process_pipeline(image: UploadFile = File(...), steps: str = Form(...)
     gc.collect()
     return {"image_base64": f"data:image/png;base64,{b64}"}
 
-# ================================================
-# Entry point
-# ================================================
+# ---------- Khởi động ----------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
